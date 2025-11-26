@@ -1,0 +1,189 @@
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+
+import javax.naming.NamingException;
+
+import org.apache.commons.logging.Log;
+import org.apache.commons.logging.LogFactory;
+
+import com.dbg.iam.accounts.AccountSchema;
+import com.dbg.iam.application.ApplicationSchema;
+import com.dbg.iam.connect.npi.NPISchema;
+import com.dbg.iam.connect.oaad.AdSchema;
+import com.dbg.iam.identities.IdentitiesSchema;
+import com.dbg.iam.role.RoleType;
+import com.dbg.iam.util.AccountUtils;
+import com.dbg.iam.util.AuditUtils;
+import com.dbg.iam.util.CertificationUtils;
+import com.dbg.iam.util.DateUtils;
+import com.dbg.iam.util.ExtendedAttributes;
+import com.dbg.iam.util.LdapUtils;
+import com.dbg.iam.util.OAADUtil;
+import com.dbg.iam.util.RoleUtils;
+import com.dbg.iam.util.TaskUtils;
+import com.dbg.iam.util.Utils;
+import com.dbg.iam.util.WorkgroupUtil;
+
+import sailpoint.api.Describer;
+import sailpoint.api.IdIterator;
+import sailpoint.api.SailPointContext;
+import sailpoint.api.Terminator;
+import sailpoint.object.AccountSelectorRules;
+import sailpoint.object.Application;
+import sailpoint.object.Attributes;
+import sailpoint.object.Bundle;
+import sailpoint.object.Custom;
+import sailpoint.object.Filter;
+import sailpoint.object.Identity;
+import sailpoint.object.Link;
+import sailpoint.object.LocalizedAttribute;
+import sailpoint.object.ManagedAttribute;
+import sailpoint.object.Profile;
+import sailpoint.object.QueryOptions;
+import sailpoint.object.Source;
+import sailpoint.object.TaskResult;
+import sailpoint.object.TaskResult.CompletionStatus;
+import sailpoint.object.TaskSchedule;
+import sailpoint.task.AbstractTaskExecutor;
+import sailpoint.tools.GeneralException;
+import sailpoint.tools.Util;
+import sailpoint.tools.VelocityUtil;
+
+public class AlfrescoRoleCreation {
+    // constants (as shown in the images)
+    static final String ALFRESCO_CUSTOM_OBJECT = "DBG Alfresco role custom object";
+    static final String ENTRY_LIST = "entryList";
+    static final String APPLICATION_NAME = "applicationName";
+    static final String PROPERTY = "property";
+    static final String OWNER = "defaultWorkgroup";
+    static final String B_CONT = "businessContainerName";
+    static final String IT_CONT = "itContainerName";
+    static final String IS_CRITICAL = "isCritical";
+    static final String IS_REQUESTABLE = "isRequestable";
+    static final String IS_STRICTER = "isStricter";
+    static final String SOD_TAG = "sodtag";
+    static final String AID = "aid";
+    static final String B_SUBTYPE = "bsubtype";
+    static final String TIER_LEVEL = "tierLevel";
+    static final String DESCRIPTION = "description";
+
+    // Example method body extracted from screenshot
+    public Bundle createRolesFromCustomObject(SailPointContext context) throws GeneralException {
+        Custom custom = context.getObjectByName(Custom.class, ALFRESCO_CUSTOM_OBJECT);
+
+        for (Object entryObj : Util.safeIterable(custom.getList(ENTRY_LIST))) {
+            Map curConfigEntry = Util.otom(entryObj);
+            String appName = Util.otos(curConfigEntry.get(APPLICATION_NAME));
+            String property = Util.otos(curConfigEntry.get(PROPERTY));
+            String description = Util.otos(curConfigEntry.get(DESCRIPTION));
+            String tierLevel = Util.otos(curConfigEntry.get(TIER_LEVEL));
+
+            QueryOptions qo = new QueryOptions();
+            qo.setCloneResults(true);
+            qo.addFilter(Filter.eq("application.name", appName));
+
+            IdIterator ids = new IdIterator(context, ManagedAttribute.class, qo);
+
+            if (ids != null) {
+                if (ids.hasNext()) {
+                    String id = ids.next();
+                    ManagedAttribute ma = context.getObjectById(ManagedAttribute.class, id);
+                    String name = ma.getDisplayName();
+                    String maDescription = ma.getAttribute(Util.otos(entryObj)); // exact key in image unclear
+                    // Fallback property read already above
+                    if (name != null) {
+                        Bundle bundle = context.getObjectByName(Bundle.class, name);
+
+                        if (bundle == null) {
+                            Application application = context.getObjectByName(Application.class, appName);
+                            List entitlements = Arrays.asList(ma.getValue());
+                            Profile profile = new Profile();
+                            if (appName != null) {
+                                Filter filter = Filter.containsAll(property, entitlements);
+                                profile.addConstraint(filter);
+                                profile.setApplication(application);
+                                context.saveObject(profile);
+                            }
+
+                            String itRoleName = ""; // image shows an assignment here; original name unknown
+                            Identity owner = context.getObjectByName(Identity.class, Util.otos(curConfigEntry.get(OWNER)));
+                            Bundle bContainer = context.getObjectByName(Bundle.class, Util.otos(curConfigEntry.get(B_CONT)));
+                            Bundle itContainer = context.getObjectByName(Bundle.class, Util.otos(curConfigEntry.get(IT_CONT)));
+
+                            Boolean isCritical = Util.otob(curConfigEntry.get(IS_CRITICAL));
+                            Boolean isRequestable = Util.otob(curConfigEntry.get(IS_REQUESTABLE));
+                            Boolean isStricter = Util.otob(curConfigEntry.get(IS_STRICTER));
+
+                            // create IT role
+                            Bundle itBundle = RoleUtils.createRoleForMultipleAccounts(
+                                context,
+                                itRoleName,
+                                RoleType.IT.toString(),
+                                owner,
+                                appName,
+                                itContainer,
+                                null,       // maybe account list / options
+                                profile,
+                                tierLevel,
+                                description,
+                                isCritical,
+                                isRequestable,
+                                isStricter
+                            );
+
+                            itBundle.setAttribute(ExtendedAttributes.SOD_TAG, Util.otos(curConfigEntry.get(SOD_TAG)));
+                            itBundle.setAttribute(ExtendedAttributes.AID, Util.otos(curConfigEntry.get(AID)));
+                            context.saveObject(itBundle);
+
+                            List<Bundle> itBundles = new ArrayList<Bundle>();
+                            itBundles.add(itBundle);
+
+                            if (!itBundles.isEmpty()) {
+                                // create Business role with the IT bundle as a child
+                                Bundle businessBundle = RoleUtils.createRoleForMultipleAccounts(
+                                    context,
+                                    name,
+                                    RoleType.BUSINESS.toString(),
+                                    owner,
+                                    appName,
+                                    bContainer,
+                                    itBundles,
+                                    null, // maybe profile or other param (image unclear)
+                                    tierLevel,
+                                    description,
+                                    isCritical,
+                                    isRequestable,
+                                    isStricter
+                                );
+
+                                businessBundle.setAttribute(ExtendedAttributes.SOD_TAG, Util.otos(curConfigEntry.get(SOD_TAG)));
+                                businessBundle.setAttribute(ExtendedAttributes.EXTERNAL_SOURCE_ATTRIBUTE, appName);
+                                businessBundle.setAttribute(ExtendedAttributes.AID, Util.otos(curConfigEntry.get(AID)));
+                                // I saw a BUNDLE_DBG_SUB_TYPE attribute being set referencing AID in the image:
+                                businessBundle.setAttribute(ExtendedAttributes.BUNDLE_DBG_SUB_TYPE, Util.otos(curConfigEntry.get(AID)));
+
+                                context.saveObject(businessBundle);
+
+                                return businessBundle;
+                            } else {
+                                Log log = LogFactory.getLog(AlfrescoRoleCreation.class);
+                                log.error("IT role is not created properly: " + ma.getDisplayName());
+                            }
+                        } else {
+                            Log log = LogFactory.getLog(AlfrescoRoleCreation.class);
+                            log.error("displayName is null or bundle exists: " + ma.getValue());
+                        }
+                    }
+                }
+            }
+        }
+
+        return null;
+    }
+}
